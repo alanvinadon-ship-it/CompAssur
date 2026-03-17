@@ -1,0 +1,872 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// --- Core Models ---
+
+enum UserRole {
+  client
+  conseiller_interne
+  courtier_partenaire
+  partner_manager
+  super_admin
+  // V1-10: Supervision / Regulator roles
+  regulator_viewer
+  regulator_auditor
+  regulator_case_inspector
+  asaci_observer
+  asaci_audit
+}
+
+model User {
+  id              String         @id @default(uuid())
+  phone_number    String         @unique
+  email           String?        @unique
+  full_name       String
+  role            UserRole       @default(client)
+  password_hash   String? // For admin/broker login, if not OTP
+  created_at      DateTime       @default(now())
+  updated_at      DateTime       @updatedAt
+  
+  // Relations
+  broker_profile  BrokerProfile? // One-to-one with BrokerProfile
+  leads           Lead[]
+  quote_requests  QuoteRequest[]
+  ai_sessions     AiSession[]
+  consent_logs    ConsentLog[]
+  audit_logs      AuditLog[]
+  documents       Document[]
+}
+
+model Insurer {
+  id        String  @id @default(uuid())
+  name      String  @unique
+  logo_url  String?
+  contact_name  String?
+  contact_email String?
+  contact_phone String?
+  zones     String?   // JSON array of covered zones
+  active_products String? // JSON array: ['auto','scolaire']
+  onboarded Boolean @default(false)
+  plans     Plan[]
+  commission_rules CommissionRule[] @relation("InsurerToCommissionRule")
+  documents InsurerDocument[]
+  dataset_versions InsurerDatasetVersion[]
+}
+
+model Product {
+  id    String @id @default(uuid())
+  name  String @unique
+  slug  String @unique // 'auto', 'scolaire'
+  plans Plan[]
+  quote_requests QuoteRequest[]
+  pricing_rules PricingRule[]
+  commission_rules CommissionRule[] @relation("ProductToCommissionRule")
+  insurer_documents InsurerDocument[]
+}
+
+model Plan {
+  id          String         @id @default(uuid())
+  product_id  String
+  insurer_id  String
+  name        String
+  version     Int            @default(1)
+  price       Float? // Base price for mock/simple calculation
+  badge       String? // 'best_price', 'balanced', 'premium'
+  created_at  DateTime       @default(now())
+  updated_at  DateTime       @updatedAt
+
+  product       Product        @relation(fields: [product_id], references: [id])
+  insurer       Insurer        @relation(fields: [insurer_id], references: [id])
+  plan_coverages PlanCoverage[]
+  leads         Lead[]
+  quote_results QuoteResult[]
+}
+
+model Coverage {
+  id            String         @id @default(uuid())
+  coverage_code String         @unique
+  name          String
+  plan_coverages PlanCoverage[]
+}
+
+model PlanCoverage {
+  id            String  @id @default(uuid())
+  plan_id       String
+  coverage_id   String
+  included      Boolean
+  limit         String
+  deductible    String
+
+  plan          Plan    @relation(fields: [plan_id], references: [id])
+  coverage      Coverage @relation(fields: [coverage_id], references: [id])
+
+  @@unique([plan_id, coverage_id])
+}
+
+model QuoteRequest {
+  id          String        @id @default(uuid())
+  user_id     String
+  product_id  String
+  data        Json // Raw input data for the quote
+  created_at  DateTime      @default(now())
+  updated_at  DateTime      @updatedAt
+
+  user        User          @relation(fields: [user_id], references: [id])
+  product     Product       @relation(fields: [product_id], references: [id])
+  quote_results QuoteResult[]
+  leads       Lead[]
+}
+
+model QuoteResult {
+  id              String       @id @default(uuid())
+  quote_request_id String
+  plan_id         String
+  price           Float
+  scores          Json // { price: 90, protection: 70, balance: 80 }
+  coverages_details Json // Detailed coverages for this specific offer
+  created_at      DateTime     @default(now())
+
+  quote_request   QuoteRequest @relation(fields: [quote_request_id], references: [id])
+  plan            Plan         @relation(fields: [plan_id], references: [id])
+}
+
+enum LeadStatus {
+  new
+  assigned
+  contacted
+  closed
+}
+
+model Lead {
+  id                String    @id @default(uuid())
+  quote_request_id  String
+  plan_id           String
+  user_id           String
+  status            LeadStatus @default(new)
+  client_name       String
+  client_phone      String
+  product_name      String
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
+
+  quote_request     QuoteRequest @relation(fields: [quote_request_id], references: [id])
+  plan              Plan      @relation(fields: [plan_id], references: [id])
+  user              User      @relation(fields: [user_id], references: [id])
+  case_file         CaseFile? // One-to-one with CaseFile
+}
+
+// --- Courtage Models ---
+
+enum CaseStatus {
+  new
+  contacted
+  qualified
+  docs_pending
+  proposed
+  won
+  lost
+}
+
+model CaseFile {
+  id                String         @id @default(uuid())
+  lead_id           String         @unique
+  owner_id          String // BrokerProfile ID
+  status            CaseStatus     @default(new)
+  client_name       String
+  client_phone      String?
+  product_name      String
+  created_at        DateTime       @default(now())
+  updated_at        DateTime       @updatedAt
+  sla_expires_at    DateTime? // For lead assignment SLA
+
+  lead              Lead           @relation(fields: [lead_id], references: [id])
+  owner             BrokerProfile  @relation(fields: [owner_id], references: [id])
+  status_history    CaseStatusHistory[]
+  interactions      Interaction[]
+  documents         Document[]
+  commissions       Commission[]
+  broker_assignments BrokerAssignment[]
+}
+
+model CaseStatusHistory {
+  id          String     @id @default(uuid())
+  case_file_id String
+  status      CaseStatus
+  changed_by  String // User ID of who changed it
+  created_at  DateTime   @default(now())
+
+  case_file   CaseFile   @relation(fields: [case_file_id], references: [id])
+}
+
+model BrokerProfile {
+  id                String          @id @default(uuid())
+  user_id           String          @unique
+  zone              String
+  skills            Json // Store as JSON array, e.g., [\'auto\', \'scolaire\']
+  availability      Json // e.g., { lundi: \'8h-17h\' }
+  performance_score Int             @default(0)
+  max_active_leads  Int             @default(10)
+  active_leads_count Int            @default(0)
+  status            String          @default("active") // 'active', 'inactive'
+  created_at        DateTime        @default(now())
+  updated_at        DateTime        @updatedAt
+
+  user              User            @relation(fields: [user_id], references: [id])
+  case_files        CaseFile[]
+  broker_assignments BrokerAssignment[]
+  commissions       Commission[]
+}
+
+model BrokerAssignment {
+  id            String        @id @default(uuid())
+  case_file_id  String        @unique
+  broker_id     String
+  assigned_at   DateTime      @default(now())
+  expires_at    DateTime?
+  status        String        @default("active") // 'active', 'expired', 'revoked'
+
+  case_file     CaseFile      @relation(fields: [case_file_id], references: [id])
+  broker        BrokerProfile @relation(fields: [broker_id], references: [id])
+}
+
+enum InteractionType {
+  call
+  whatsapp
+  email
+  note
+  status_change
+}
+
+model Interaction {
+  id            String        @id @default(uuid())
+  case_file_id  String
+  actor_id      String // User ID
+  type          InteractionType
+  content       String
+  created_at    DateTime      @default(now())
+
+  case_file     CaseFile      @relation(fields: [case_file_id], references: [id])
+}
+
+enum CommissionRuleType {
+  percentage
+  fixed_amount
+}
+
+enum CommissionStatus {
+  due
+  paid
+  disputed
+}
+
+model CommissionRule {
+  id          String           @id @default(uuid())
+  insurer_id  String
+  product_id  String
+  plan_id     String? // Optional, if rule applies to specific plan
+  rule_type   CommissionRuleType
+  value       Float
+  created_at  DateTime         @default(now())
+  updated_at  DateTime         @updatedAt
+
+  insurer     Insurer          @relation(fields: [insurer_id], references: [id], name: "InsurerToCommissionRule")
+  product     Product          @relation(fields: [product_id], references: [id], name: "ProductToCommissionRule")
+}
+
+model Commission {
+  id              String           @id @default(uuid())
+  case_file_id    String
+  broker_id       String
+  expected_amount Float
+  paid_amount     Float            @default(0)
+  status          CommissionStatus @default(due)
+  paid_at         DateTime? // When the commission was actually paid
+  payout_batch_id String? // Link to a payout batch if applicable
+  created_at      DateTime         @default(now())
+  updated_at      DateTime         @updatedAt
+
+  case_file       CaseFile         @relation(fields: [case_file_id], references: [id])
+  broker          BrokerProfile    @relation(fields: [broker_id], references: [id])
+}
+
+// --- Documents ---
+enum DocVerificationStatus {
+  pending
+  verified
+  rejected
+}
+
+model Document {
+  id                  String                @id @default(uuid())
+  user_id             String // Uploader
+  case_file_id        String?
+  insurer_document_id String?
+  file_path           String // S3/MinIO path
+  document_type       String // e.g., 'carte_grise', 'permis', 'bulletin_scolaire'
+  verification_status DocVerificationStatus @default(pending)
+  verified_by         String? // User ID of verifier
+  created_at          DateTime              @default(now())
+  updated_at          DateTime              @updatedAt
+
+  user                User?                 @relation(fields: [user_id], references: [id])
+  case_file           CaseFile?             @relation(fields: [case_file_id], references: [id])
+  insurer_document    InsurerDocument?      @relation(fields: [insurer_document_id], references: [id])
+}
+
+model InsurerDocument {
+  id          String    @id @default(uuid())
+  insurer_id  String
+  product_id  String
+  document_name String
+  file_path   String // S3/MinIO path to the template document
+  version     Int       @default(1)
+  created_at  DateTime  @default(now())
+  updated_at  DateTime  @updatedAt
+
+  insurer     Insurer   @relation(fields: [insurer_id], references: [id])
+  product     Product   @relation(fields: [product_id], references: [id])
+  documents   Document[]
+}
+
+// --- AI V1-04 ---
+
+model AiDocument {
+  id            String   @id @default(uuid())
+  document_id   String?  // ref to Document table (optional)
+  insurer_id    String?
+  product_slug  String?  // 'auto', 'scolaire'
+  doc_name      String
+  doc_version   Int      @default(1)
+  status        String   @default("pending") // pending, processing, ready, error
+  error_message String?
+  chunk_count   Int      @default(0)
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  chunks        AiChunk[]
+}
+
+model AiChunk {
+  id            String   @id @default(uuid())
+  ai_document_id String
+  chunk_index   Int
+  chunk_text    String
+  metadata      Json     // { page, section, insurer, product, plan }
+  embedding_ref String?  // reference in vector store
+  created_at    DateTime @default(now())
+
+  ai_document   AiDocument @relation(fields: [ai_document_id], references: [id])
+  citations     AiCitation[]
+}
+
+model AiSession {
+  id          String     @id @default(uuid())
+  user_id     String
+  channel     String     @default("web") // web, mobile
+  case_id     String?    // optional link to case
+  lead_id     String?    // optional link to lead
+  created_at  DateTime   @default(now())
+  updated_at  DateTime   @updatedAt
+
+  user        User       @relation(fields: [user_id], references: [id])
+  messages    AiMessage[]
+}
+
+model AiMessage {
+  id          String     @id @default(uuid())
+  session_id  String
+  role        String     // 'user', 'assistant', 'system'
+  content     String
+  escalate    Boolean    @default(false)
+  flags       Json?      // ['no_source', 'sensitive', 'escalate']
+  handoff_summary Json?  // structured summary for broker
+  created_at  DateTime   @default(now())
+
+  session     AiSession  @relation(fields: [session_id], references: [id])
+  citations   AiCitation[]
+  feedback    AiFeedback[]
+  ai_flags    AiFlag[]
+}
+
+model AiCitation {
+  id            String   @id @default(uuid())
+  message_id    String
+  ai_chunk_id   String
+  score         Float    // relevance score
+  snippet_start Int?     // offset in chunk
+  snippet_end   Int?
+  created_at    DateTime @default(now())
+
+  message       AiMessage @relation(fields: [message_id], references: [id])
+  chunk         AiChunk   @relation(fields: [ai_chunk_id], references: [id])
+}
+
+model AiFeedback {
+  id          String   @id @default(uuid())
+  message_id  String
+  rating      Int      // 1-5
+  tags        Json?    // ['helpful', 'accurate', 'unclear']
+  comment     String?
+  created_at  DateTime @default(now())
+
+  message     AiMessage @relation(fields: [message_id], references: [id])
+}
+
+model AiFlag {
+  id          String   @id @default(uuid())
+  message_id  String
+  flag_type   String   // 'hallucination', 'offensive', 'wrong_info', 'pii_leak'
+  details     String?
+  resolved    Boolean  @default(false)
+  created_at  DateTime @default(now())
+
+  message     AiMessage @relation(fields: [message_id], references: [id])
+}
+
+// --- Audit & Consent ---
+model AuditLog {
+  id            String   @id @default(uuid())
+  actor_id      String // User ID
+  action        String
+  resource_type String
+  resource_id   String
+  ip_address    String?
+  user_agent    String?
+  created_at    DateTime @default(now())
+
+  actor         User     @relation(fields: [actor_id], references: [id])
+}
+
+model ConsentLog {
+  id            String   @id @default(uuid())
+  user_id       String
+  consent_type  String // 'share_to_broker', 'contact_ok', 'data_processing_ok'
+  granted       Boolean
+  created_at    DateTime @default(now())
+
+  user          User     @relation(fields: [user_id], references: [id])
+}
+
+// --- OTP ---
+model OtpSession {
+  id            String   @id @default(uuid())
+  phone_number  String
+  otp_code      String
+  expires_at    DateTime
+  is_verified   Boolean  @default(false)
+  created_at    DateTime @default(now())
+}
+
+// --- Pricing Rules (MVP) ---
+model PricingRule {
+  id          String   @id @default(uuid())
+  product_id  String
+  min_value   Float
+  max_value   Float
+  factor      Float // Multiplier for base price
+  dataset_version_id String? // Link to insurer dataset version
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  product     Product  @relation(fields: [product_id], references: [id])
+  dataset_version InsurerDatasetVersion? @relation(fields: [dataset_version_id], references: [id])
+}
+
+// --- V1-06: Insurer Dataset Versioning ---
+
+enum DatasetStatus {
+  draft
+  validated
+  published
+  archived
+}
+
+model InsurerDatasetVersion {
+  id            String        @id @default(uuid())
+  insurer_id    String
+  version       Int           @default(1)
+  status        DatasetStatus @default(draft)
+  label         String?       // e.g. "Import Mars 2026"
+  import_source String?       // filename of import
+  errors_json   Json?         // validation errors from import
+  published_at  DateTime?
+  created_by    String?       // admin user id
+  created_at    DateTime      @default(now())
+  updated_at    DateTime      @updatedAt
+
+  insurer       Insurer       @relation(fields: [insurer_id], references: [id])
+  pricing_rules PricingRule[]
+  import_rows   ImportRow[]
+  versioned_plans       VersionedPlan[]
+  versioned_coverages   VersionedPlanCoverage[]
+  versioned_pricing     VersionedPricingRule[]
+  versioned_docs        VersionedDocIndex[]
+}
+
+model ImportRow {
+  id                    String   @id @default(uuid())
+  dataset_version_id    String
+  sheet_name            String?  // source sheet name
+  row_index             Int
+  row_type              String   // 'plan', 'pricing_rule', 'coverage_mapping', 'doc_index'
+  raw_data              Json     // original row as JSON
+  parsed_data           Json?    // parsed/validated data
+  errors                Json?    // validation errors for this row
+  created_at            DateTime @default(now())
+
+  dataset_version       InsurerDatasetVersion @relation(fields: [dataset_version_id], references: [id])
+}
+
+// --- V1-07: Versioned Entities (Allianz import) ---
+
+model VersionedPlan {
+  id                    String   @id @default(uuid())
+  dataset_version_id    String
+  insurer_id            String
+  product               String   // 'AUTO' or 'SCOLAIRE'
+  plan_code             String
+  plan_name             String
+  plan_description      String?
+  currency              String   @default("XOF")
+  billing_period        String   @default("ANNUAL")
+  base_premium_min      Float    @default(0)
+  base_premium_max      Float    @default(0)
+  is_active             Boolean  @default(true)
+  version_label         String?
+  effective_date        DateTime?
+  expiry_date           DateTime?
+  source_doc_id         String?
+  notes                 String?
+  created_at            DateTime @default(now())
+
+  dataset_version       InsurerDatasetVersion @relation(fields: [dataset_version_id], references: [id])
+  versioned_coverages   VersionedPlanCoverage[]
+  versioned_pricing     VersionedPricingRule[]
+}
+
+model VersionedPlanCoverage {
+  id                    String   @id @default(uuid())
+  dataset_version_id    String
+  versioned_plan_id     String
+  product               String
+  plan_code             String
+  coverage_code         String
+  included              Boolean  @default(true)
+  limit_amount          Float?
+  limit_unit            String?
+  deductible_amount     Float?
+  deductible_notes      String?
+  exclusions_summary    String?
+  conditions_notes      String?
+  source_doc_id         String?
+  created_at            DateTime @default(now())
+
+  dataset_version       InsurerDatasetVersion @relation(fields: [dataset_version_id], references: [id])
+  versioned_plan        VersionedPlan @relation(fields: [versioned_plan_id], references: [id])
+}
+
+model VersionedPricingRule {
+  id                    String   @id @default(uuid())
+  dataset_version_id    String
+  versioned_plan_id     String?
+  rule_id               String   // from XLSX
+  product               String
+  plan_code             String
+  zone                  String?
+  usage                 String?  // AUTO only
+  school_type           String?  // SCOLAIRE only
+  option_pack           String?  // SCOLAIRE only
+  vehicle_value_min     Float?   // AUTO only
+  vehicle_value_max     Float?   // AUTO only
+  driver_age_min        Int?     // AUTO only
+  driver_age_max        Int?     // AUTO only
+  student_age_min       Int?     // SCOLAIRE only
+  student_age_max       Int?     // SCOLAIRE only
+  premium_amount        Float    @default(0)
+  currency              String   @default("XOF")
+  effective_date        DateTime?
+  expiry_date           DateTime?
+  notes                 String?
+  created_at            DateTime @default(now())
+
+  dataset_version       InsurerDatasetVersion @relation(fields: [dataset_version_id], references: [id])
+  versioned_plan        VersionedPlan? @relation(fields: [versioned_plan_id], references: [id])
+}
+
+model VersionedDocIndex {
+  id                    String   @id @default(uuid())
+  dataset_version_id    String
+  doc_id                String   // from XLSX (e.g. ALLZ_DOC_001)
+  insurer_name          String
+  product               String
+  doc_type              String   // BROCHURE, CONDITIONS, TARIF, OTHER
+  doc_title             String
+  doc_version           String?
+  doc_date              DateTime?
+  file_name             String?
+  status                String   @default("PENDING") // PENDING, READY, FAILED, DISABLED
+  notes                 String?
+  created_at            DateTime @default(now())
+
+  dataset_version       InsurerDatasetVersion @relation(fields: [dataset_version_id], references: [id])
+}
+
+// --- V1-08: Analytics, SLA Config, Feature Flags ---
+
+model AnalyticsEvent {
+  id            String   @id @default(uuid())
+  event_name    String   // start_quote, submit_quote, view_results, etc.
+  user_id       String?
+  session_id    String?
+  device        String?  // web, mobile, broker_portal
+  zone          String?
+  product       String?  // auto, scolaire
+  insurer       String?  // e.g. 'allianz'
+  variant       String?  // A/B test variant: 'A', 'B', null
+  flag_key      String?  // feature flag key if applicable
+  metadata      Json?    // Additional event-specific data
+  created_at    DateTime @default(now())
+}
+
+model SlaConfig {
+  id                    String   @id @default(uuid())
+  name                  String   @unique // e.g. 'first_response', 'closure'
+  description           String?
+  threshold_minutes     Int      // SLA threshold in minutes
+  escalation_action     String   @default("notify_admin") // notify_admin, reassign
+  active                Boolean  @default(true)
+  created_at            DateTime @default(now())
+  updated_at            DateTime @updatedAt
+  breach_logs           SlaBreachLog[]
+}
+
+model SlaBreachLog {
+  id              String   @id @default(uuid())
+  sla_config_id   String
+  case_file_id    String
+  broker_id       String?
+  breach_type     String   // 'first_response', 'closure'
+  breached_at     DateTime @default(now())
+  resolved        Boolean  @default(false)
+  resolved_at     DateTime?
+  resolved_by     String?  // admin user id
+  action_taken    String?  // 'reassigned', 'notified', 'manual'
+
+  sla_config      SlaConfig @relation(fields: [sla_config_id], references: [id])
+}
+
+model FeatureFlag {
+  id            String   @id @default(uuid())
+  key           String   @unique // e.g. 'quote_flow_variant', 'results_layout', 'lead_capture'
+  description   String?
+  variants      Json     // e.g. ["A", "B"]
+  default_variant String @default("A")
+  traffic_split Json?    // e.g. { "A": 50, "B": 50 }
+  active        Boolean  @default(false)
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  assignments   FeatureFlagAssignment[]
+}
+
+model FeatureFlagAssignment {
+  id            String   @id @default(uuid())
+  flag_id       String
+  session_id    String   // user session or user_id
+  variant       String   // assigned variant
+  created_at    DateTime @default(now())
+
+  flag          FeatureFlag @relation(fields: [flag_id], references: [id])
+
+  @@unique([flag_id, session_id])
+}
+
+// --- V1-09 : Subscriptions & Payments ---
+
+model Subscription {
+  id              String   @id @default(uuid())
+  case_id         String
+  quote_result_id String?  // link to chosen QuoteResult
+  user_id         String
+  plan_id         String?
+  insurer_id      String?
+  product_name    String
+  plan_name       String?
+  premium_amount  Float
+  currency        String   @default("XOF")
+  frequency       String   @default("monthly") // monthly, quarterly, annual, one_time
+  status          String   @default("PENDING") // PENDING, SUBSCRIBED, PAYMENT_PENDING, CANCELLED, EXPIRED
+  start_date      DateTime?
+  end_date        DateTime?
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  payments        Payment[]
+  schedules       PaymentSchedule[]
+  receipts        Receipt[]
+}
+
+model Payment {
+  id              String   @id @default(uuid())
+  subscription_id String
+  case_id         String?
+  amount          Float
+  currency        String   @default("XOF")
+  method          String   @default("mobile_money") // mobile_money, bank_transfer, cash, card
+  provider        String   @default("mock") // mock, orange_money, mtn_momo, moov_money
+  status          String   @default("INITIATED") // INITIATED, PENDING, PAID, FAILED, CANCELLED
+  provider_ref    String?  // external reference from provider
+  failure_reason  String?
+  paid_at         DateTime?
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  subscription    Subscription @relation(fields: [subscription_id], references: [id])
+  receipts        Receipt[]
+}
+
+model PaymentSchedule {
+  id              String   @id @default(uuid())
+  subscription_id String
+  frequency       String   @default("monthly") // monthly, quarterly, annual
+  installment_num Int      // 1, 2, 3...
+  total_installments Int
+  amount          Float
+  currency        String   @default("XOF")
+  due_date        DateTime
+  status          String   @default("UPCOMING") // UPCOMING, DUE, PAID, OVERDUE, CANCELLED
+  payment_id      String?  // linked when paid
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  subscription    Subscription @relation(fields: [subscription_id], references: [id])
+}
+
+model Receipt {
+  id              String   @id @default(uuid())
+  payment_id      String
+  subscription_id String?
+  receipt_number  String   @unique
+  type            String   @default("generated") // generated, uploaded
+  file_path       String?  // local path or S3 key
+  doc_id          String?  // link to Document if uploaded
+  issued_at       DateTime @default(now())
+  created_at      DateTime @default(now())
+
+  payment         Payment      @relation(fields: [payment_id], references: [id])
+  subscription    Subscription? @relation(fields: [subscription_id], references: [id])
+}
+
+// --- V1-10 : Supervision & Contrôle (ASACI / Régulateur) ---
+
+enum ComplaintStatus {
+  received
+  in_review
+  forwarded
+  resolved
+  rejected
+}
+
+enum ComplaintCategory {
+  service_quality
+  pricing_dispute
+  claim_handling
+  document_issue
+  fraud_suspicion
+  other
+}
+
+model Complaint {
+  id              String           @id @default(uuid())
+  user_id         String?          // optional, masked by default
+  insurer_id      String?
+  case_id         String?
+  broker_id       String?
+  category        ComplaintCategory @default(other)
+  status          ComplaintStatus  @default(received)
+  subject         String
+  description     String
+  resolution      String?
+  assigned_to     String?          // supervision agent
+  sla_due_at      DateTime?
+  resolved_at     DateTime?
+  created_at      DateTime         @default(now())
+  updated_at      DateTime         @updatedAt
+}
+
+enum FlagType {
+  duplicate_case
+  suspicious_document
+  excessive_claims
+  cancellation_spike
+  pricing_anomaly
+  attestation_mismatch
+  manual_flag
+}
+
+model SupervisionFlag {
+  id              String   @id @default(uuid())
+  case_id         String?
+  insurer_id      String?
+  broker_id       String?
+  flag_type       FlagType
+  severity        String   @default("medium") // low, medium, high, critical
+  reason          String   // required justification
+  details         Json?    // additional structured data
+  status          String   @default("open") // open, investigating, resolved, dismissed
+  resolved_by     String?
+  resolved_at     DateTime?
+  created_by      String
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+}
+
+model AttestationCheck {
+  id              String   @id @default(uuid())
+  input_ref       String   // attestation number or QR code content
+  input_type      String   @default("number") // number, qr_code
+  result          String   // valid, invalid, not_found, error, pending
+  insurer_id      String?
+  insurer_name    String?
+  policy_holder   String?  // masked by default
+  policy_number   String?
+  valid_from      DateTime?
+  valid_to        DateTime?
+  vehicle_info    String?  // masked by default
+  details         Json?    // raw response from external API
+  checked_by      String   // user id of checker
+  source          String   @default("stub") // stub, api_external, batch_import
+  created_at      DateTime @default(now())
+}
+
+model ExportRegistry {
+  id              String   @id @default(uuid())
+  export_type     String   // kpi, sla, complaints, anomalies, attestations, plans_health
+  format          String   @default("csv") // csv, pdf
+  filters         Json?    // filters applied
+  row_count       Int      @default(0)
+  file_path       String?  // local path to generated file
+  file_hash       String?  // SHA-256 hash for integrity
+  generated_by    String   // user id
+  created_at      DateTime @default(now())
+}
+
+// Enhanced audit for supervision (extends existing AuditLog via details field)
+model SupervisionAuditLog {
+  id              String   @id @default(uuid())
+  actor_id        String
+  action          String   // view_kpi, export, unmask_pii, flag_case, verify_attestation, etc.
+  resource_type   String   // complaint, case, attestation, export, pii
+  resource_id     String?
+  reason          String?  // required for PII access
+  ip_address      String?
+  user_agent      String?
+  details         Json?    // additional context
+  created_at      DateTime @default(now())
+}
